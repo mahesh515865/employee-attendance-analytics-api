@@ -1,0 +1,14 @@
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.pytest_cache/
+.coverage
+htmlcov/
+openapi_live.json
