@@ -630,13 +630,8 @@ def list_attendance(
     skip = (page - 1) * page_size
     total = db.attendance_logs.count_documents(q)
     page_docs = list(db.attendance_logs.find(q).sort([("date", -1), ("emp_code", 1)]).skip(skip).limit(page_size))
-    for d in page_docs:
-        d.pop("_id", None)
-        # Convert datetime fields to epoch milliseconds for API response
-        if d.get("punch_in") is not None:
-            d["punch_in"] = utc_dt_to_epoch_millis(d["punch_in"])
-        if d.get("punch_out") is not None:
-            d["punch_out"] = utc_dt_to_epoch_millis(d["punch_out"])
+    # Convert each record using the standard helper for consistency
+    page_docs = [record_to_api(doc) for doc in page_docs]
     return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
 
 
@@ -2187,6 +2182,46 @@ def explain_endpoint(
             "$sort": {
                 "total_late_minutes": -1,
                 "_id.emp_code": 1
+            }
+        })
+
+        # Stage 9: Add rank using standard competition ranking (same total_late_minutes gets same rank)
+        pipeline.append({
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {
+                    "rank": {
+                        "$rank": {}
+                    }
+                }
+            }
+        })
+
+        # Stage 10: Filter to keep only items where rank <= limit
+        pipeline.append({
+            "$match": {
+                "rank": {"$lte": limit}
+            }
+        })
+
+        # Stage 11: Sort by total_late_minutes descending, then emp_code ascending (final display order)
+        pipeline.append({
+            "$sort": {
+                "total_late_minutes": -1,
+                "_id.emp_code": 1
+            }
+        })
+
+        # Stage 12: Project to match the expected response format
+        pipeline.append({
+            "$project": {
+                "_id": 0,
+                "rank": 1,
+                "emp_code": "$_id.emp_code",
+                "name": "$_id.name",
+                "department": "$_id.department",
+                "total_late_minutes": 1,
+                "late_count": 1
             }
         })
 
