@@ -1,19 +1,10 @@
-"""
-Employee Attendance & Analytics API - STARTER
+"""Employee Attendance & Analytics API (FastAPI + MongoDB)"""
 
-Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
-
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
-"""
 import os
 import math
 import decimal
-from datetime import datetime, timedelta, timezone, time
+from datetime import datetime, timedelta, timezone, time, date
 from typing import Optional
-from datetime import date
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
@@ -33,18 +24,19 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+def compute_late_minutes(punch_in: datetime, shift_start: str, attendance_date: str) -> int:
     """Compute late minutes in IST, grace period is 10 minutes."""
-    # Convert punch_in from UTC to IST
-    punch_in_ist = utc_dt_to_ist_dt(punch_in)
+    # attendance_date is string YYYY-MM-DD
+    year, month, day = map(int, attendance_date.split("-"))
     h, m = map(int, shift_start.split(":"))
-    # Create shift start datetime in IST on the same day as punch_in_ist
-    start_ist = punch_in_ist.replace(hour=h, minute=m, second=0, microsecond=0)
+    # Create shift start datetime in IST on the attendance_date
+    start_ist = datetime(year, month, day, hour=h, minute=m, second=0, microsecond=0, tzinfo=IST)
+    # Convert punch_in to IST
+    punch_in_ist = utc_dt_to_ist_dt(punch_in)
     # Calculate elapsed minutes from shift start to punch_in
     elapsed_minutes = (punch_in_ist - start_ist).total_seconds() / 60
     # Return floor of elapsed minutes only if strictly greater than 10
     return int(elapsed_minutes) if elapsed_minutes > 10 else 0
-
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     """Work hours in hours, rounded half-up to 2 decimals."""
@@ -59,7 +51,6 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str, shift_s
     h, m = map(int, shift_end.split(":"))
     shift_end_time = time(hour=h, minute=m)
     # date_str is attendance date (IST) of shift start
-    from datetime import date
     dt_date = date.fromisoformat(date_str)
     # Determine if shift is overnight: shift_end <= shift_start (time comparison)
     shift_start_h, shift_start_m = map(int, shift_start.split(":"))
@@ -118,7 +109,20 @@ def round_half_up(value: float, decimals: int) -> float:
         rounding=decimal.ROUND_HALF_UP
     )
     return float(rounded)
-
+def attendance_date_for(punch_in_utc_dt: datetime, shift_start: str, shift_end: str) -> str:
+    """Return the attendance date (YYYY-MM-DD) for a punch-in according to R1."""
+    punch_in_ist = utc_dt_to_ist_dt(punch_in_utc_dt)
+    h_start, m_start = map(int, shift_start.split(":"))
+    h_end, m_end = map(int, shift_end.split(":"))
+    shift_start_time = time(hour=h_start, minute=m_start)
+    shift_end_time = time(hour=h_end, minute=m_end)
+    overnight = shift_end_time <= shift_start_time
+    if overnight and punch_in_ist.time() < shift_end_time:
+        # Belongs to previous day
+        attendance_date = punch_in_ist.date() - timedelta(days=1)
+    else:
+        attendance_date = punch_in_ist.date()
+    return attendance_date.isoformat()
 
 # --------------------------------------------------------------------------- #
 # Models
@@ -460,9 +464,13 @@ class RegularizeRequest(BaseModel):
                 raise ValueError(f'status must be one of {allowed_statuses}')
         return v
 
-    @field_validator('punch_in', 'punch_out')
+    @field_validator('punch_in', 'punch_out', mode='before')
     def punch_time_must_be_valid_epoch_millis(cls, v):
-        if v is not None and (v < 100000000000 or v > 4102444800000):
+        if v is None:
+            return v
+        if type(v) is not int:
+            raise ValueError('punch time must be an integer')
+        if v < 100000000000 or v > 4102444800000:
             raise ValueError('punch time must be a valid epoch millisecond value (100000000000-4102444800000)')
         return v
 # --------------------------------------------------------------------------- #
@@ -523,9 +531,8 @@ def punch_in(body: PunchInIn):
         ts = epoch_millis_to_utc_dt(body.punched_at)
     else:
         ts = datetime.now(timezone.utc).replace(microsecond=0)
-    # Derive attendance date in IST
-    ts_ist = utc_dt_to_ist_dt(ts)
-    d = ist_dt_to_date_str(ts_ist)
+    # Derive attendance date according to R1
+    d = attendance_date_for(ts, emp["shift_start"], emp["shift_end"])
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -533,7 +540,7 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"], d),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
@@ -634,6 +641,10 @@ def punch_out(body: PunchOutIn):
     # If it's still naive, assume UTC (shouldn't happen with our storage, but safe)
     if punch_in_dt.tzinfo is None:
         punch_in_dt = punch_in_dt.replace(tzinfo=timezone.utc)
+    if ts <= punch_in_dt:
+        raise HTTPException(422, "punched_at must be after punch_in")
+    if (ts - punch_in_dt).total_seconds() > 86400:
+        raise HTTPException(422, "punched_at must be within 24 hours of punch_in")
 
     # Use the record's own date for overtime calculation (IST date when shift started)
     date_str = record["date"]
@@ -741,12 +752,11 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         if punch_in_dt.tzinfo is None:
             punch_in_dt = punch_in_dt.replace(tzinfo=timezone.utc)
 
-        # Extract date from punch_in (in IST)
-        punch_in_ist = utc_dt_to_ist_dt(punch_in_dt)
-        punch_in_date_str = punch_in_ist.date().isoformat()
+        # Compute expected attendance date using helper (R1)
+        expected_date = attendance_date_for(punch_in_dt, emp["shift_start"], emp["shift_end"])
 
         # Must match the record's date
-        if punch_in_date_str != date:
+        if expected_date != date:
             raise HTTPException(422, "punch_in must be on the same date as the attendance record's date (R1)")
 
     # Rule: punch_out must be after punch_in and within 24 hours
@@ -875,13 +885,13 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
             work_hours = compute_work_hours(punch_in_dt, punch_out_dt)
             overtime_minutes = compute_overtime(punch_out_dt, emp["shift_end"], date, emp["shift_start"])
             half_day = work_hours < 4.50
-            late_minutes = compute_late_minutes(punch_in_dt, emp["shift_start"])
+            late_minutes = compute_late_minutes(punch_in_dt, emp["shift_start"], date)
         elif punch_in_dt is not None and punch_out_dt is None:
             # Only punch_in is present (open record)
             work_hours = None
             overtime_minutes = 0
             half_day = False
-            late_minutes = compute_late_minutes(punch_in_dt, emp["shift_start"])
+            late_minutes = compute_late_minutes(punch_in_dt, emp["shift_start"], date)
         else:
             # No punch_in (absent/leave)
             work_hours = None

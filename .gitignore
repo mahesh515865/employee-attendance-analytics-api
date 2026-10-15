@@ -12,3 +12,5 @@ venv/
 .coverage
 htmlcov/
 openapi_live.json
+
+scratch/
