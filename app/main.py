@@ -24,19 +24,33 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str, attendance_date: str) -> int:
-    """Compute late minutes in IST, grace period is 10 minutes."""
-    # attendance_date is string YYYY-MM-DD
+
+def compute_late_minutes(
+    punch_in: datetime,
+    shift_start: str,
+    attendance_date: str
+) -> int:
+    """Compute late minutes in IST, with a 10-minute grace period."""
     year, month, day = map(int, attendance_date.split("-"))
     h, m = map(int, shift_start.split(":"))
-    # Create shift start datetime in IST on the attendance_date
-    start_ist = datetime(year, month, day, hour=h, minute=m, second=0, microsecond=0, tzinfo=IST)
-    # Convert punch_in to IST
+
+    start_ist = datetime(
+        year, month, day,
+        hour=h, minute=m,
+        second=0, microsecond=0,
+        tzinfo=IST
+    )
+
     punch_in_ist = utc_dt_to_ist_dt(punch_in)
-    # Calculate elapsed minutes from shift start to punch_in
-    elapsed_minutes = (punch_in_ist - start_ist).total_seconds() / 60
-    # Return floor of elapsed minutes only if strictly greater than 10
-    return int(elapsed_minutes) if elapsed_minutes > 10 else 0
+    elapsed_minutes = (
+        punch_in_ist - start_ist
+    ).total_seconds() / 60
+
+    # A punch before the scheduled shift start is not late.
+    if elapsed_minutes <= 10:
+        return 0
+
+    return int(elapsed_minutes)
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     """Work hours in hours, rounded half-up to 2 decimals."""
@@ -109,6 +123,33 @@ def round_half_up(value: float, decimals: int) -> float:
         rounding=decimal.ROUND_HALF_UP
     )
     return float(rounded)
+def _to_ms(v):
+    """Datetime -> epoch ms; ints and None are returned unchanged."""
+    if isinstance(v, datetime):
+        return utc_dt_to_epoch_millis(v)
+    return v
+
+
+def record_to_api(rec: dict) -> dict:
+    """Convert a stored attendance_logs document to the API shape."""
+    rec.pop("_id", None)
+    rec["punch_in"] = _to_ms(rec.get("punch_in"))
+    rec["punch_out"] = _to_ms(rec.get("punch_out"))
+    rec.setdefault("work_hours", None)
+    rec["late_minutes"] = rec.get("late_minutes") or 0
+    rec["overtime_minutes"] = rec.get("overtime_minutes") or 0
+    rec["half_day"] = bool(rec.get("half_day", False))
+    history = []
+    for h in rec.get("history") or []:
+        h = dict(h)
+        h["at"] = _to_ms(h.get("at"))
+        changes = {}
+        for k, c in (h.get("changes") or {}).items():
+            changes[k] = {"from": _to_ms(c.get("from")), "to": _to_ms(c.get("to"))}
+        h["changes"] = changes
+        history.append(h)
+    rec["history"] = history
+    return rec
 def attendance_date_for(punch_in_utc_dt: datetime, shift_start: str, shift_end: str) -> str:
     """Return the attendance date (YYYY-MM-DD) for a punch-in according to R1."""
     punch_in_ist = utc_dt_to_ist_dt(punch_in_utc_dt)
@@ -597,6 +638,7 @@ def list_attendance(
         if d.get("punch_out") is not None:
             d["punch_out"] = utc_dt_to_epoch_millis(d["punch_out"])
     return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
 
 
 @app.post("/attendance/punch-out")
